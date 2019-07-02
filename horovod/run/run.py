@@ -20,6 +20,10 @@ import os
 import sys
 import traceback
 import six
+import uuid
+import cloudpickle
+import textwrap
+import socket
 try:
     from shlex import quote
 except ImportError:
@@ -42,6 +46,11 @@ CACHE_STALENESS_THRESHOLD_MINUTES = 60
 # Number of retries for sshing into the hosts
 SSH_RETRIES = 5
 
+_MPI_ROOT_WDIR = "/tmp"
+_PICKLED_PROC_FN_FILENAME = "proc_fn.pkl"
+_LOCAL_PICKLED_RESULT_FILENAME = "local_result.pkl"
+_PICKLED_RESULT_FILENAME = "result.pkl"
+_PROC_LAUNCHER_FILENAME = "launch.sh"
 
 @cache.use_cache()
 def _check_all_hosts_ssh_successful(host_addresses, ssh_port=None):
@@ -343,23 +352,105 @@ def parse_args():
     return parsed_args
 
 
-def run():
+def run_from_main():
     args = parse_args()
 
     if args.version:
         print(horovod.__version__)
         exit(0)
 
-    if args.host:
+    _run(
+        mode=0,
+        np=args.np,
+        ssh_port=args.ssh_port,
+        host=args.host,
+        disable_cache=args.disable_cache,
+        start_timeout=args.start_timeout,
+        verbose=args.verbose,
+        command=args.command,
+        wdir=None)
+
+
+def run_from_notebook(
+        proc_fn,
+        proc_fn_args,
+        num_proc,
+        ssh_port,
+        host,
+        disable_cache,
+        start_timeout,
+        verbose):
+
+    wdir = os.path.join(_MPI_ROOT_WDIR, 'hvd_run_' + str(uuid.uuid4()))
+    os.makedirs(wdir)
+    if verbose:
+        print("mpirun working dir is " + wdir)
+
+    # Invokes proc_fn with args. So we don't need to pickle them separately.
+    def wrapped_proc_fn(rank=0):
+        return_value = proc_fn(*proc_fn_args)
+        if rank == 0:
+            with open(_PICKLED_RESULT_FILENAME, 'wb') as f:
+                try:
+                    cloudpickle.dump(return_value, f)
+                except Exception as e:
+                    raise RuntimeError("Caught an excpetion while pickling "
+                                       "return value: {}".format(repr(e)))
+
+    pickled_proc_fn_str = cloudpickle.dumps(wrapped_proc_fn)
+    pickled_proc_fn_path = os.path.join(wdir, _PICKLED_PROC_FN_FILENAME)
+    with open(pickled_proc_fn_path, 'wb') as f:
+        f.write(pickled_proc_fn_str)
+
+    localhostname = socket.gethostname()
+    launcher_path = os.pash.join(wdir, _PROC_LAUNCHER_FILENAME)
+    with open(launcher_path, 'w') as f:
+        f.write(textwrap.dedent("""
+        set -e
+        cd {wdir}
+        rank=${{OMPI_COMM_WORLD_RANK:-0}}
+        {exec} -c "import cloudpickle; cloudpickle.load(open('{fn_file}', 'rb'))(rank=$rank)"
+        if [[ "$rank" -eq 0 ]]; then
+        scp -q -p {ssh_port} -o StrictHostKeyChecking=no \
+        {wdir}/{local_result} {local}:{wdir}/{result}
+        fi
+        """.format(wdir=wdir,
+                   exec=sys.executable,
+                   fn_file=_PICKLED_PROC_FN_FILENAME,
+                   local=localhostname,
+                   local_result=_LOCAL_PICKLED_RESULT_FILENAME,
+                   result=_PICKLED_RESULT_FILENAME)))
+
+    os.chmod(launcher_path, '0o777')
+
+    _run(
+        mode=1,
+        np=num_proc,
+        ssh_port=ssh_port,
+        host=host,
+        disable_cache=disable_cache,
+        start_timeout=start_timeout,
+        verbose=verbose,
+        command=None,
+        wdir=wdir)
+
+    result_path = os.path.join(wdir, _PICKLED_RESULT_FILENAME)
+    with open(result_path, 'rb') as f:
+        result_bytes = f.read()
+
+    return cloudpickle.loads(result_bytes)
+
+
+def _run(mode, np, ssh_port, host, disable_cache, start_timeout, verbose, command, wdir):
+
+    if host:
         all_host_names = [x for x in
-                          [y.split(':')[0] for y in args.host.split(',')]]
+                          [y.split(':')[0] for y in host.split(',')]]
     else:
         all_host_names = []
 
     # horovodrun has to finish all the checks before this timeout runs out.
-    if args.start_timeout:
-        start_timeout = args.start_timeout
-    else:
+    if not start_timeout:
         # Lookup default timeout from the environment variable.
         start_timeout = int(os.getenv('HOROVOD_START_TIMEOUT', '30'))
 
@@ -368,31 +459,31 @@ def run():
                                     'check connectivity between servers. You '
                                     'may need to increase the --start-timeout '
                                     'parameter if you have too many servers.')
-    settings = hvd_settings.Settings(verbose=2 if args.verbose else 0,
-                                     ssh_port=args.ssh_port,
+    settings = hvd_settings.Settings(verbose=2 if verbose else 0,
+                                     ssh_port=ssh_port,
                                      key=secret.make_secret_key(),
                                      timeout=tmout,
                                      num_hosts=len(all_host_names),
-                                     num_proc=args.np)
+                                     num_proc=np)
 
     # This cache stores the results of checks performed by horovodrun
     # during the initialization step. It can be disabled by setting
     # --disable-cache flag.
     fn_cache = None
-    if not args.disable_cache:
+    if not disable_cache:
         params = ''
-        if args.np:
-            params += str(args.np) + ' '
-        if args.host:
-            params += str(args.host) + ' '
-        if args.ssh_port:
-            params += str(args.ssh_port)
+        if np:
+            params += str(np) + ' '
+        if host:
+            params += str(host) + ' '
+        if ssh_port:
+            params += str(ssh_port)
         parameters_hash = hashlib.md5(params.encode('utf-8')).hexdigest()
         fn_cache = cache.Cache(CACHE_FOLDER, CACHE_STALENESS_THRESHOLD_MINUTES,
                                parameters_hash)
 
     remote_host_names = []
-    if args.host:
+    if host:
         if settings.verbose >= 2:
             print("Filtering local host names.")
         remote_host_names = network.filter_local_addresses(all_host_names)
@@ -401,18 +492,33 @@ def run():
             if settings.verbose >= 2:
                 print("Checking ssh on all remote hosts.")
             # Check if we can ssh into all remote hosts successfully.
-            _check_all_hosts_ssh_successful(remote_host_names, args.ssh_port,
+            _check_all_hosts_ssh_successful(remote_host_names, ssh_port,
                                             fn_cache=fn_cache)
             if settings.verbose >= 2:
                 print("SSH was successful into all the remote hosts.")
 
-        hosts_arg = "-H {hosts}".format(hosts=args.host)
+            if mode == 1:
+                # Copy working dir to all remote machines
+                for remote_host in set(remote_host_names):
+                    scp_cmd = "scp -r -q -p {ssh_port} -o StrictHostKeyChecking=no " \
+                              "{wdir} {remote_host}:{root_wdir}" \
+                                .format(ssh_port=ssh_port, wdir=wdir,
+                                        remote_host=remote_host, root_wdir=_MPI_ROOT_WDIR)
+                    output = six.StringIO()
+                    exit_code = safe_shell_exec.execute(scp_cmd, stdout=output, stderr=output)
+                    if exit_code != 0:
+                        output_msg = output.getvalue()
+                        raise RuntimeError("Copy working dir to remote host {remote_host} failed."
+                                           "Error message is {msg}".format(
+                                            remote_host=remote_host, msg=output_msg))
+
+        hosts_arg = "-H {hosts}".format(hosts=host)
     else:
         # if user does not specify any hosts, mpirun by default uses local host.
         # There is no need to specify localhost.
         hosts_arg = ""
 
-    if args.host and len(remote_host_names) > 0:
+    if host and len(remote_host_names) > 0:
         if settings.verbose >= 2:
             print("Testing interfaces on all the hosts.")
 
@@ -454,11 +560,17 @@ def run():
             'training script using the standard way provided by your'
             ' MPI distribution (usually mpirun, srun, or jsrun).')
 
-    if args.ssh_port:
+    if ssh_port:
         ssh_port_arg = "-mca plm_rsh_args \"-p {ssh_port}\"".format(
-            ssh_port=args.ssh_port)
+            ssh_port=ssh_port)
     else:
         ssh_port_arg = ""
+
+    if mode == 0:
+        wdir_arg = ""
+    else:
+        wdir_arg = "-wdir {wdir}".format(wdir=wdir)
+        command = _PROC_LAUNCHER_FILENAME
 
     mpirun_command = (
         'mpirun --allow-run-as-root --tag-output '
@@ -469,22 +581,35 @@ def run():
         '{tcp_intf_arg} '
         '-x NCCL_DEBUG=INFO '
         '{nccl_socket_intf_arg} '
+        '{wdir_arg} '
         '{env} {command}'  # expect a lot of environment variables
             .format(num_proc=settings.num_proc,
                     hosts_arg=hosts_arg,
                     tcp_intf_arg=tcp_intf_arg,
                     nccl_socket_intf_arg=nccl_socket_intf_arg,
                     ssh_port_arg=ssh_port_arg,
+                    wdir_arg=wdir_arg,
                     env=' '.join('-x %s' % key for key in env.keys()
                                  if env_util.is_exportable(key)),
-                    command=' '.join(quote(par) for par in args.command))
+                    command=' '.join(quote(par) for par in command))
     )
 
     if settings.verbose >= 2:
         print(mpirun_command)
-    # Execute the mpirun command.
-    os.execve('/bin/sh', ['/bin/sh', '-c', mpirun_command], env)
+
+    if mode == 0:
+        # Execute the mpirun command.
+        os.execve('/bin/sh', ['/bin/sh', '-c', mpirun_command], env)
+    else:
+        # Execute the mpirun command in subprocess and get result back from rank-0 process.
+        output = six.StringIO()
+        exit_code = safe_shell_exec.execute(mpirun_command, stdout=output, stderr=output)
+        if exit_code != 0:
+            output_msg = output.getvalue()
+            raise RuntimeError("mpi run failed. Exit code is {exit_code}"
+                               "Output message is {output}"
+                               .format(exit_code=exit_code, output=output_msg))
 
 
 if __name__ == "__main__":
-    run()
+    run_from_main()
