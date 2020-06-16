@@ -103,7 +103,13 @@ def _make_spark_thread(spark_context, spark_job_group, driver, result_queue,
             procs = spark_context.range(0, numSlices=settings.num_proc)
             # We assume that folks caring about security will enable Spark RPC encryption,
             # thus ensuring that key that is passed here remains secret.
-            result = procs.mapPartitionsWithIndex(_make_mapper(driver.addresses(), settings, use_gloo)).collect()
+            def dbg_wrapper(split_index, it):
+                import os
+                print(f"DBG: dbg_wrapper: {os.environ['PYTHONPATH']}")
+                import pyspark
+                for v in _make_mapper(driver.addresses(), settings, use_gloo)(split_index, it):
+                    yield v
+            result = procs.mapPartitionsWithIndex(dbg_wrapper).collect()
             result_queue.put(result)
         except:
             driver.notify_spark_job_failed()
